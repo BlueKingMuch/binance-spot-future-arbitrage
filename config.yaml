@@ -1,0 +1,65 @@
+# --- HAUPTKONFIGURATION ---
+# Schaltet den realen Handel ein (true) oder aus (false, für Simulation).
+# Im Simulationsmodus werden keine echten Orders platziert.
+LIVE_TRADING: false
+
+# --- STRATEGIE- & RISIKOMANAGEMENT-PARAMETER ---
+strategy:
+  # Währungspaare, die für den Handel verwendet werden.
+  SPOT_QUOTE_CURRENCY: "USDC"
+  FUTURE_QUOTE_CURRENCY: "USDT"
+
+  # Schwellenwerte für den Einstieg (entry) und Ausstieg (exit) aus einem Trade.
+  # Bsp: 1.010 bedeutet, der Spread muss 1.0% betragen, um einen Trade zu eröffnen.
+  ENTRY_THRESHOLD_FACTOR: 1.010
+  EXIT_THRESHOLD_FACTOR: 1.003
+
+  # Wie viel Prozent der verfügbaren Liquidität im Orderbuch für die Positionsgröße genutzt werden soll.
+  PERCENTAGE_TRADE_AMOUNT_LIQUIDITY: 0.75
+  # Minimale und maximale Größe eines einzelnen Trades in USDC.
+  MIN_TRADE_AMOUNT_USDC: 25
+  MAX_TRADE_AMOUNT_USDC: 350
+  # Maximaler Prozentsatz des Gesamtkapitals, der für offene Positionen gebunden sein darf.
+  MAX_CAPITAL_ALLOCATION_PERCENT: 90
+
+  # Sicherheitschecks: Trades werden ignoriert, wenn...
+  # ... der Spread zwischen Spot- und Future-Markt unplausibel hoch ist (>25%).
+  MAX_PLAUSIBLE_SPREAD: 0.25
+  # ... der Spread zwischen Bid und Ask auf einem der Märkte zu hoch ist (>5%).
+  MAX_INTERNAL_SPREAD: 0.05
+
+  # Maximale Haltedauer für eine Position in Stunden, bevor eine automatische Schließung erzwungen wird.
+  MAX_HOLDING_HOURS: 2
+  # Maximale erlaubte Zeitdifferenz zwischen den Preis-Updates von Spot und Future in Millisekunden.
+  MAX_TIME_DIFFERENCE_MS: 150
+  # Schließe eine Position X Sekunden, bevor das Asset von Binance delisted wird.
+  FORCE_EXIT_BEFORE_DELIST_SECONDS: 3600
+  # Minimale Haltedauer eines Trades in Sekunden, um "Flip-Trades" zu vermeiden.
+  MIN_TRADE_LIFETIME_SECONDS: 2
+
+# --- WARTUNGSKONFIGURATION ---
+maintenance:
+  # Schaltet die gesamte Wartungslogik ein (true) oder aus (false).
+  ENABLE: true
+  # Schwellenwert in Prozent für die Kapital-Imbalance zwischen Margin- und Futures-Konto, bevor ein Ausgleich gestartet wird.
+  CAPITAL_DIFFERENCE_THRESHOLD_PERCENT: 1.0
+  # Beträge unter diesem USDT-Wert werden im Margin-Konto als "Staub" betrachtet und zu BNB konvertiert.
+  MARGIN_DUST_THRESHOLD_USDT: 10.0
+  # Minimaler BNB-Bestand, der pro Konto (Margin & Future) gehalten werden soll.
+  BNB_MIN_PER_ACCOUNT: 0.05
+  # Wie viel USDC ausgegeben wird, um BNB zu kaufen, wenn der Bestand zu niedrig ist.
+  BNB_BUY_AMOUNT_USDC: 20.0
+  # Kleinste Menge an BNB, die zwischen den Konten transferiert wird.
+  MIN_BNB_TRANSFER_AMOUNT: 0.00001
+
+# --- SYSTEM & API ---
+system:
+  # Intervall in Stunden, in dem nach neuen handelbaren Paaren gesucht wird.
+  RE_DISCOVERY_INTERVAL_HOURS: 6
+  # Intervall in Sekunden für periodische Aufgaben (Kontostand-Log, Maintenance-Check).
+  SYSTEM_TASK_INTERVAL_SECONDS: 600
+  # Binance WebSocket URLs
+  FUTURES_WS_URL: "wss://fstream.binance.com/ws/!bookTicker"
+  SPOT_WS_BASE_URL: "wss://stream.binance.com:9443/stream?streams="
+  # Basis-Assets, die vom Handel ausgeschlossen werden sollen (z.B. wegen geringer Liquidität oder hoher Volatilität).
+  BLACKLISTED_BASE_ASSETS: ["SUSDC", "EUR", "BNSOL", "BDOT", "BETH", "WBTC", "BTCST"]
