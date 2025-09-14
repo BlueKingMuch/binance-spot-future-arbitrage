@@ -27,8 +27,8 @@ Ein Arbitrage-Bot für den Handel zwischen Binance Spot (Cross Margin) und USD-M
 
 1.  **Repository klonen:**
     ```bash
-    git clone https://github.com/DEIN-BENUTZERNAME/DEIN-REPO-NAME.git
-    cd DEIN-REPO-NAME
+    git clone https://github.com/bluekingmuch/binance-spot-future-arbitrage.git
+    cd binance-spot-future-arbitrage
     ```
 
 2.  **Virtuelle Umgebung erstellen & aktivieren (empfohlen):**
@@ -96,7 +96,7 @@ An arbitrage bot for trading between Binance Spot (Cross Margin) and USD-M Futur
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/YOUR-USERNAME/YOUR-REPO-NAME.git
+    git clone https://github.com/bluekingmuch/binance-spot-future-arbitrage.git
     cd YOUR-REPO-NAME
     ```
 
@@ -139,5 +139,6 @@ python bot.py --debug
 ```
 
 ### License
+
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
