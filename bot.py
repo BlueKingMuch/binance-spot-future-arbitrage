@@ -322,14 +322,12 @@ async def execute_trade_task(opp, trade_value_usd):
                 if opp.base_asset in tracked_opportunities: del tracked_opportunities[opp.base_asset]
                 return
 
-
             approx_price = (opp.entry_spot_prices['ask'] + opp.entry_future_prices['bid']) / 2
             target_quantity = trade_value_usd / approx_price
             
             spot_step = float(spot_qty_rules['stepSize'])
             future_step = float(future_qty_rules['stepSize'])
 
-            # Wähle die gröbere (größere) stepSize als Basis, um Mismatches zu vermeiden
             if future_step > spot_step:
                 base_qty = adjust_quantity_to_rules(target_quantity, future_qty_rules, rounding_direction='down')
             else:
@@ -351,20 +349,27 @@ async def execute_trade_task(opp, trade_value_usd):
             spot_order_success, future_order_success = False, False
             spot_resp_full, future_fill = None, None
 
-            try:
-                # --- LEGS PARALLEL ERÖFFNEN ---
-                if opp.direction == 'spot_high':
-                    spot_task = client.create_margin_order(symbol=spot_symbol, side='SELL', type='MARKET', quantity=spot_quantity, sideEffectType='AUTO_BORROW_REPAY', newOrderRespType='FULL')
-                    future_task = client.futures_create_order(symbol=future_symbol, side='BUY', type='MARKET', quantity=future_quantity)
-                else: # 'future_high' Logik
-                    spot_task = client.create_margin_order(symbol=spot_symbol, side='BUY', type='MARKET', quantity=spot_quantity, sideEffectType='AUTO_BORROW_REPAY', newOrderRespType='FULL')
-                    future_task = client.futures_create_order(symbol=future_symbol, side='SELL', type='MARKET', quantity=future_quantity)
-                
-                spot_resp_full, future_resp_initial = await asyncio.gather(spot_task, future_task)
+            # --- LEGS PARALLEL ERÖFFNEN ---
+            if opp.direction == 'spot_high':
+                spot_task = client.create_margin_order(symbol=spot_symbol, side='SELL', type='MARKET', quantity=spot_quantity, sideEffectType='AUTO_BORROW_REPAY', newOrderRespType='FULL')
+                future_task = client.futures_create_order(symbol=future_symbol, side='BUY', type='MARKET', quantity=future_quantity)
+            else: # 'future_high' Logik
+                spot_task = client.create_margin_order(symbol=spot_symbol, side='BUY', type='MARKET', quantity=spot_quantity, sideEffectType='AUTO_BORROW_REPAY', newOrderRespType='FULL')
+                future_task = client.futures_create_order(symbol=future_symbol, side='SELL', type='MARKET', quantity=future_quantity)
+            
+            # asyncio.gather mit return_exceptions=True verwenden
+            spot_result, future_result = await asyncio.gather(spot_task, future_task, return_exceptions=True)
+
+            # --- ERGEBNISSE AUSWERTEN ---
+
+            # Spot-Leg auswerten
+            if isinstance(spot_result, Exception):
+                logging.error(f"Spot leg failed for {opp.trade_id}: {spot_result}")
+            else:
                 spot_order_success = True
+                spot_resp_full = spot_result
                 opp.spot_order_id = spot_resp_full['orderId']
                 opp.spot_entry_fill = spot_resp_full
-
                 total_executed_qty = float(spot_resp_full.get('executedQty', 0))
                 total_commission_in_base = sum(
                     float(fill['commission']) for fill in spot_resp_full.get('fills', [])
@@ -373,15 +378,24 @@ async def execute_trade_task(opp, trade_value_usd):
                 opp.executed_spot_qty_net = total_executed_qty - total_commission_in_base
                 logging.info(f"Spot-Fill-Analyse für {opp.trade_id}: Brutto={total_executed_qty}, Gebühren={total_commission_in_base}, Netto={opp.executed_spot_qty_net}")
 
-                # Warte auf den vollständigen Fill der Future-Order
-                future_fill = await wait_for_order_fill(client, future_symbol, future_resp_initial['orderId'], is_futures=True)
-                if future_fill:
-                    future_order_success = True
-                    opp.future_order_id = future_resp_initial['orderId']
-                    opp.future_entry_fill = future_fill
-                else:
-                    raise Exception("Future order did not fill in time.")
+            # Future-Leg auswerten
+            if isinstance(future_result, Exception):
+                logging.error(f"Future leg (initial creation) failed for {opp.trade_id}: {future_result}")
+            else:
+                try:
+                    future_fill = await wait_for_order_fill(client, future_symbol, future_result['orderId'], is_futures=True)
+                    if future_fill:
+                        future_order_success = True
+                        opp.future_order_id = future_result['orderId']
+                        opp.future_entry_fill = future_fill
+                    else:
+                        logging.error(f"Future order for {opp.trade_id} did not fill in time.")
+                except Exception as e:
+                    logging.error(f"Error waiting for future fill for {opp.trade_id}: {e}")
 
+
+            if spot_order_success and future_order_success:
+                # Erfolgsfall: Beide Legs wurden ausgeführt
                 latency_ms = (time.time() - start_time) * 1000
                 exec_spot_price, spot_entry_fee = compute_vwap_and_fees(opp.spot_entry_fill.get("fills", []), SPOT_QUOTE_CURRENCY)
                 exec_future_price = float(future_fill['avgPrice'])
@@ -399,23 +413,41 @@ async def execute_trade_task(opp, trade_value_usd):
                 )
                 opp.status = "open"
 
-            except Exception as e:
-                logging.error(f"Error during atomic open for {opp.trade_id}: {e}")
-                # --- ROLLBACK LOGIK ---
-                if spot_order_success and not future_order_success:
-                    logging.warning(f"ROLLBACK: Future leg failed. Closing spot leg for {opp.trade_id}.")
-                    try:
-                        rollback_qty = opp.executed_spot_qty_net # Verwende die exakte Netto-Menge
-                        if opp.direction == 'spot_high': # Wir haben geshortet (SELL), also zurückkaufen (BUY)
-                            await client.create_margin_order(symbol=spot_symbol, side='BUY', type='MARKET', quantity=rollback_qty, sideEffectType='AUTO_REPAY')
-                        else: # Wir haben gelongt (BUY), also verkaufen (SELL)
-                            await client.create_margin_order(symbol=spot_symbol, side='SELL', type='MARKET', quantity=rollback_qty, sideEffectType='AUTO_REPAY')
-                        logging.info(f"Rollback for {opp.trade_id} successful.")
-                    except Exception as rb_e:
-                        logging.critical(f"ROLLBACK FAILED for {opp.trade_id}. MANUAL INTERVENTION REQUIRED. Error: {rb_e}")
+            elif spot_order_success and not future_order_success:
+                # Rollback-Fall: Spot erfolgreich, Future fehlgeschlagen
+                logging.warning(f"ROLLBACK: Future leg failed. Closing spot leg for {opp.trade_id}.")
+                try:
+                    rollback_qty = opp.executed_spot_qty_net
+                    if opp.direction == 'spot_high': # Wir haben geshortet (SELL), also zurückkaufen (BUY)
+                        await client.create_margin_order(symbol=spot_symbol, side='BUY', type='MARKET', quantity=rollback_qty, sideEffectType='AUTO_REPAY')
+                    else: # Wir haben gelongt (BUY), also verkaufen (SELL)
+                        await client.create_margin_order(symbol=spot_symbol, side='SELL', type='MARKET', quantity=rollback_qty, sideEffectType='AUTO_REPAY')
+                    logging.info(f"Rollback of spot leg for {opp.trade_id} successful.")
+                except Exception as rb_e:
+                    logging.critical(f"SPOT LEG ROLLBACK FAILED for {opp.trade_id}. MANUAL INTERVENTION REQUIRED. Error: {rb_e}")
+                
+                if opp.base_asset in tracked_opportunities: del tracked_opportunities[opp.base_asset]
+                return
 
-                if opp.base_asset in tracked_opportunities:
-                    del tracked_opportunities[opp.base_asset]
+            elif not spot_order_success and future_order_success:
+                # Fehlender Rollback hinzugefügt
+                logging.warning(f"ROLLBACK: Spot leg failed. Closing future leg for {opp.trade_id}.")
+                try:
+                    rollback_qty = float(future_fill['executedQty'])
+                    if opp.direction == 'spot_high': # Future war BUY, also für Rollback SELL
+                        await client.futures_create_order(symbol=future_symbol, side='SELL', type='MARKET', quantity=rollback_qty)
+                    else: # Future war SELL, also für Rollback BUY
+                        await client.futures_create_order(symbol=future_symbol, side='BUY', type='MARKET', quantity=rollback_qty)
+                    logging.info(f"Rollback of future leg for {opp.trade_id} successful.")
+                except Exception as rb_e:
+                    logging.critical(f"FUTURE LEG ROLLBACK FAILED for {opp.trade_id}. MANUAL INTERVENTION REQUIRED. Error: {rb_e}")
+
+                if opp.base_asset in tracked_opportunities: del tracked_opportunities[opp.base_asset]
+                return
+            
+            else: # Beide sind fehlgeschlagen
+                logging.error(f"Both legs failed to execute for {opp.trade_id}. No rollback needed.")
+                if opp.base_asset in tracked_opportunities: del tracked_opportunities[opp.base_asset]
                 return
 
         except Exception as e:
