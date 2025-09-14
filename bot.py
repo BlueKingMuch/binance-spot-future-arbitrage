@@ -393,7 +393,6 @@ async def execute_trade_task(opp, trade_value_usd):
                 except Exception as e:
                     logging.error(f"Error waiting for future fill for {opp.trade_id}: {e}")
 
-
             if spot_order_success and future_order_success:
                 # Erfolgsfall: Beide Legs wurden ausgeführt
                 latency_ms = (time.time() - start_time) * 1000
@@ -534,11 +533,20 @@ async def close_trade_task(opp):
                 future_close_fill = await wait_for_order_fill(client, future_symbol, future_resp['orderId'], is_futures=True)
 
             if spot_close_fill and future_close_fill and opp.spot_entry_fill:
-                spot_entry_vwap, spot_entry_fee = compute_vwap_and_fees(opp.spot_entry_fill.get("fills", []), SPOT_QUOTE_CURRENCY)
-                spot_exit_vwap, spot_exit_fee = compute_vwap_and_fees(spot_close_fill.get("fills", []), SPOT_QUOTE_CURRENCY)
-                pnl_calculation_qty = float(opp.spot_entry_fill.get('executedQty', 0))
-                spot_pnl = (spot_entry_vwap - spot_exit_vwap) * pnl_calculation_qty if opp.direction == "spot_high" else (spot_exit_vwap - spot_entry_vwap) * pnl_calculation_qty
+                # KORRIGIERTE PNL-BERECHNUNG FÜR SPOT
+                # Wir verwenden cummulativeQuoteQty für eine exakte, von der API gelieferte PnL-Berechnung.
+                spot_entry_notional = float(opp.spot_entry_fill.get('cummulativeQuoteQty', 0))
+                spot_exit_notional = float(spot_close_fill.get('cummulativeQuoteQty', 0))
+
+                if opp.direction == "spot_high": # Entry war SELL (Geld erhalten), Exit war BUY (Geld ausgegeben)
+                    spot_pnl = spot_entry_notional - spot_exit_notional
+                else: # 'future_high', Entry war BUY (Geld ausgegeben), Exit war SELL (Geld erhalten)
+                    spot_pnl = spot_exit_notional - spot_entry_notional
+                
+                _, spot_entry_fee = compute_vwap_and_fees(opp.spot_entry_fill.get("fills", []), SPOT_QUOTE_CURRENCY)
+                _, spot_exit_fee = compute_vwap_and_fees(spot_close_fill.get("fills", []), SPOT_QUOTE_CURRENCY)
                 total_spot_fees = spot_entry_fee + spot_exit_fee
+                
                 start_time_ms = int(opp.entry_time.timestamp() * 1000)
                 end_time_ms = int(datetime.now().timestamp() * 1000)
                 
