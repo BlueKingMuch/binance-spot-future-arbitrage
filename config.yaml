@@ -56,8 +56,10 @@ maintenance:
 system:
   # Intervall in Stunden, in dem nach neuen handelbaren Paaren gesucht wird.
   RE_DISCOVERY_INTERVAL_HOURS: 6
-  # Intervall in Sekunden für periodische Aufgaben (Kontostand-Log, Maintenance-Check).
-  SYSTEM_TASK_INTERVAL_SECONDS: 600
+  # Intervall in Sekunden für periodische Aufgaben (Maintenance-Check).
+  SYSTEM_TASK_INTERVAL_SECONDS: 3600
+  # Intervall in Sekunden für Debug - Log (Kontostand-Log, offene Positionen).
+  DEBUG_TASK_INTERVAL_SECONDS: 900
   # Binance WebSocket URLs
   FUTURES_WS_URL: "wss://fstream.binance.com/ws/!bookTicker"
   SPOT_WS_BASE_URL: "wss://stream.binance.com:9443/stream?streams="
