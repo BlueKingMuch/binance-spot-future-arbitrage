@@ -853,6 +853,15 @@ def check_single_exit(base_asset, spot_prices, future_prices, convergence_spread
     opp = tracked_opportunities.get(base_asset)
     if not opp or opp.status != "open": return
 
+    if opp.realized_entry_spread_factor < EXIT_THRESHOLD_FACTOR:
+        logging.error(f"[EXIT - BAD ENTRY] Closing trade on {base_asset} due to realized entry spread below EXIT_THRESHOLD_FACTOR ({EXIT_THRESHOLD_FACTOR}): {opp.realized_entry_spread_factor:.5f}. Current conv. spread: {convergence_spread:.5f}")
+        if LIVE_TRADING:
+            opp.status = "closing"
+            asyncio.create_task(close_trade_task(opp))
+        else:
+            del tracked_opportunities[base_asset]
+        return 
+
     if datetime.now() - opp.entry_time > timedelta(hours=MAX_HOLDING_HOURS):
         logging.warning(f"[EXIT - TIMEOUT] id={opp.trade_id} dur={(datetime.now() - opp.entry_time).total_seconds():.1f}s")
         if LIVE_TRADING:
@@ -1308,3 +1317,4 @@ if __name__ == "__main__":
             asyncio.run(run_main(args))
         except KeyboardInterrupt:
             logging.info("Logger stopped by user (Ctrl+C).")
+
