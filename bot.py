@@ -63,6 +63,7 @@ MIN_BNB_TRANSFER_AMOUNT = cfg_maint['MIN_BNB_TRANSFER_AMOUNT']
 cfg_sys = config['system']
 RE_DISCOVERY_INTERVAL_HOURS = cfg_sys['RE_DISCOVERY_INTERVAL_HOURS']
 SYSTEM_TASK_INTERVAL_SECONDS = cfg_sys['SYSTEM_TASK_INTERVAL_SECONDS']
+DEBUG_TASK_INTERVAL_SECONDS = cfg_sys['DEBUG_TASK_INTERVAL_SECONDS']
 FUTURES_WS_URL = cfg_sys['FUTURES_WS_URL']
 SPOT_WS_BASE_URL = cfg_sys['SPOT_WS_BASE_URL']
 BLACKLISTED_BASE_ASSETS = set(cfg_sys['BLACKLISTED_BASE_ASSETS'])
@@ -88,6 +89,14 @@ FUTURE_EXCHANGE_INFO = {}
 account_state_cache = {"total_equity": 0.0,"available_capital": 0.0}
 margin_interest_rates = {}
 futures_funding_rates = {}
+account_state_cache = {
+    "margin_account": {},
+    "futures_account": {},
+    "btc_price": 0.0,
+    "total_equity": 0.0,
+    "available_capital": 0.0,
+    "last_update": None
+}
 
 class Opportunity:
     def __init__(self, base_asset, direction, entry_spread, spot_prices, future_prices):
@@ -161,9 +170,8 @@ def compute_futures_vwap_and_fees(trades: list):
     return (total_quote / total_qty if total_qty > 0 else 0), total_fee, realized_pnl
 
 def get_fees_from_fills(fills: list, quote_currency: str) -> float:
-    #Summiert die Gebühren aus dem 'fills'-Array einer Order und rechnet sie in die Quote-Währung um
     total_fee = 0.0
-    if not fills: return 0.0  # Sicherheitsabfrage für leere Listen
+    if not fills: return 0.0
     for fill in fills:
         commission = float(fill.get('commission', 0))
         if commission > 0:
@@ -175,36 +183,81 @@ def get_fees_from_fills(fills: list, quote_currency: str) -> float:
     return total_fee
 
 
-async def log_and_update_cache(client):
+def recalculate_account_metrics():
     global account_state_cache
     try:
-        async with asyncio.timeout(10):
-            margin_account_task = client.get_margin_account()
-            future_account_task = client.futures_account()
-            btc_price_task = client.get_symbol_ticker(symbol=f"BTC{FUTURE_QUOTE_CURRENCY}")
-            margin_account, future_account, btc_price_ticker = await asyncio.gather(margin_account_task, future_account_task, btc_price_task)
-        INTERNAL_CURRENCY = FUTURE_QUOTE_CURRENCY
-        margin_free_usdc = float(next((a['free'] for a in margin_account['userAssets'] if a['asset'] == SPOT_QUOTE_CURRENCY), "0"))
-        btc_price = float(btc_price_ticker['price'])
-        margin_net_asset_btc = float(margin_account['totalNetAssetOfBtc'])
+        margin_account = account_state_cache.get("margin_account", {})
+        future_account = account_state_cache.get("futures_account", {})
+        btc_price = account_state_cache.get("btc_price", 0.0)
+
+        if not margin_account or not future_account or btc_price == 0.0:
+            return 
+
+        margin_free_usdc = float(next((a['free'] for a in margin_account.get('userAssets', []) if a['asset'] == SPOT_QUOTE_CURRENCY), "0"))
+        
+        margin_net_asset_btc = float(margin_account.get('totalNetAssetOfBtc', 0.0))
         margin_equity_usdt = margin_net_asset_btc * btc_price
+
         total_wallet_balance = float(future_account.get('totalWalletBalance', "0"))
         total_unrealized_pnl = float(future_account.get('totalUnrealizedProfit', "0"))
         futures_equity = total_wallet_balance + total_unrealized_pnl
+        
         futures_available_margin = float(future_account.get('availableBalance', "0"))
+        
         total_equity = margin_equity_usdt + futures_equity
         available_capital = margin_free_usdc + futures_available_margin
+
         account_state_cache["total_equity"] = total_equity
         account_state_cache["available_capital"] = available_capital
-        log_message = (
-            f"\n--- Account Balances (Reporting in {INTERNAL_CURRENCY}) ---\n"
-            f"Spot Margin: Equity: {margin_equity_usdt:,.2f} | Free (USDC): {margin_free_usdc:,.2f}\n"
-            f"Futures:     Equity: {futures_equity:,.2f} | Available Margin: {futures_available_margin:,.2f}\n"
-            f"---------------------------------------------------\n"
-            f"TOTAL EQUITY: {total_equity:,.2f} {INTERNAL_CURRENCY}"
-        )
-        logging.info(log_message)
-    except Exception as e: logging.error(f"Could not fetch account balances or update cache: {e}")
+        account_state_cache["last_update"] = datetime.now()
+
+    except Exception as e:
+        logging.error(f"Fehler bei der Neuberechnung der Account-Metriken: {e}")
+
+
+async def initial_account_sync(client: AsyncClient):
+    global account_state_cache
+    logging.info("Führe initialen Account-Sync durch...")
+    try:
+        async with asyncio.timeout(15):
+            margin_account_task = client.get_margin_account()
+            future_account_task = client.futures_account()
+            btc_price_task = client.get_symbol_ticker(symbol=f"BTC{FUTURE_QUOTE_CURRENCY}")
+            
+            margin_account, future_account, btc_price_ticker = await asyncio.gather(
+                margin_account_task, future_account_task, btc_price_task
+            )
+
+        account_state_cache["margin_account"] = margin_account
+        account_state_cache["futures_account"] = future_account
+        account_state_cache["btc_price"] = float(btc_price_ticker['price'])
+        
+        recalculate_account_metrics()
+        logging.info("Initialer Account-Sync erfolgreich. Cache ist befüllt.")
+        await log_account_state()
+
+    except Exception as e:
+        logging.critical(f"Konnte initialen Account-Status nicht abrufen. Beende Bot. Fehler: {e}")
+        exit()
+
+
+async def log_account_state():
+    INTERNAL_CURRENCY = FUTURE_QUOTE_CURRENCY
+    cache = account_state_cache
+    
+    margin_equity_usdt = cache['total_equity'] - (float(cache['futures_account'].get('totalWalletBalance', 0)) + float(cache['futures_account'].get('totalUnrealizedProfit', 0)))
+    margin_free_usdc = float(next((a['free'] for a in cache['margin_account'].get('userAssets', []) if a['asset'] == SPOT_QUOTE_CURRENCY), "0"))
+    futures_equity = cache['total_equity'] - margin_equity_usdt
+    futures_available_margin = float(cache['futures_account'].get('availableBalance', "0"))
+
+    log_message = (
+        f"\n--- Account State (Cache, Stand: {cache['last_update'].strftime('%H:%M:%S') if cache['last_update'] else 'N/A'}) ---\n"
+        f"Spot Margin: Equity: {margin_equity_usdt:,.2f} | Free (USDC): {margin_free_usdc:,.2f}\n"
+        f"Futures:     Equity: {futures_equity:,.2f} | Available Margin: {futures_available_margin:,.2f}\n"
+        f"TOTAL EQUITY: {cache['total_equity']:,.2f} {INTERNAL_CURRENCY}\n"
+        f"---------------------------------------------------"
+    )
+    logging.info(log_message)
 
 # --- Funktionen zum Aktualisieren der Zins- und Funding-Raten ---
 async def update_interest_rates(client: AsyncClient):
@@ -340,7 +393,7 @@ async def execute_trade_task(opp, trade_value_usd):
                 logging.error(f"Trade {opp.trade_id} aborted: zero quantity after rounding.")
                 if opp.base_asset in tracked_opportunities: del tracked_opportunities[opp.base_asset]
                 return
-            
+            await log_account_state()
             logging.info(
                 f"[EXECUTE OPEN] id={opp.trade_id} dir={opp.direction} "
                 f"consistent_qty={spot_quantity} notional≈{spot_quantity * approx_price:.2f} {SPOT_QUOTE_CURRENCY}"
@@ -533,8 +586,6 @@ async def close_trade_task(opp):
                 future_close_fill = await wait_for_order_fill(client, future_symbol, future_resp['orderId'], is_futures=True)
 
             if spot_close_fill and future_close_fill and opp.spot_entry_fill:
-                # KORRIGIERTE PNL-BERECHNUNG FÜR SPOT
-                # Wir verwenden cummulativeQuoteQty für eine exakte, von der API gelieferte PnL-Berechnung.
                 spot_entry_notional = float(opp.spot_entry_fill.get('cummulativeQuoteQty', 0))
                 spot_exit_notional = float(spot_close_fill.get('cummulativeQuoteQty', 0))
 
@@ -566,6 +617,7 @@ async def close_trade_task(opp):
                     f"fees: spot={total_spot_fees:.4f}, future={fut_fee:.4f} "
                     f"TOTAL_NET_PNL={total_net_pnl:+.4f} {SPOT_QUOTE_CURRENCY}"
                 )
+                await log_account_state()
             else:
                 logging.error(f"Could not retrieve all fill data for PnL analysis of {opp.trade_id}.")
 
@@ -954,7 +1006,6 @@ async def periodic_system_tasks(client: AsyncClient):
 
     while True:
         try:
-            await log_and_update_cache(client)
             await check_and_run_maintenance(client)
             await asyncio.sleep(SYSTEM_TASK_INTERVAL_SECONDS)
 
@@ -963,6 +1014,116 @@ async def periodic_system_tasks(client: AsyncClient):
         except Exception as e:
             logging.error(f"Fehler in periodic_system_tasks: {e}")
             await asyncio.sleep(60)
+            
+async def btc_price_stream_handler(client: AsyncClient):
+    base_ws_url = "wss://stream.binance.com:9443/ws"
+    url = f"{base_ws_url}/btcusdt@ticker"
+    while True:
+        try:
+            async with websockets.connect(url) as websocket:
+                logging.info("BTC-Preis-Stream verbunden.")
+                async for message in websocket:
+                    data = json.loads(message)
+                    if 'c' in data: 
+                        account_state_cache['btc_price'] = float(data['c'])
+                        if account_state_cache.get("margin_account"):
+                            recalculate_account_metrics()
+        except Exception as e:
+            logging.error(f"Fehler im BTC-Preis-Stream: {e}. Verbinde neu in 5s...")
+            await asyncio.sleep(5)
+            
+async def spot_user_stream_handler(client: AsyncClient):
+    base_ws_url = "wss://stream.binance.com:9443/ws"
+    
+    while True:
+        try:
+            listen_key = await client.margin_stream_get_listen_key()
+            url = f"{base_ws_url}/{listen_key}"
+            
+            async def keepalive():
+                while True:
+                    await asyncio.sleep(30 * 60) 
+                    await client.margin_stream_keepalive(listenKey=listen_key)
+
+            keepalive_task = asyncio.create_task(keepalive())
+            
+            async with websockets.connect(url) as websocket:
+                logging.info("Spot/Margin User Data Stream verbunden.")
+                async for message in websocket:
+                    data = json.loads(message)
+                    if data.get('e') == 'outboundAccountPosition':
+                        asset_map = {asset['asset']: asset for asset in account_state_cache['margin_account']['userAssets']}
+                        
+                        for asset_update in data.get('B', []):
+                            asset_symbol = asset_update.get('a')
+                            if asset_symbol in asset_map:
+                                asset_map[asset_symbol]['free'] = asset_update.get('f')
+                                asset_map[asset_symbol]['locked'] = asset_update.get('l')
+                            else:
+                                new_asset = {
+                                    'asset': asset_symbol, 'free': asset_update.get('f'), 'locked': asset_update.get('l'),
+                                    'borrowed': '0.0', 'interest': '0.0', 'netAsset': '0.0'
+                                }
+                                account_state_cache['margin_account']['userAssets'].append(new_asset)
+                                
+                        recalculate_account_metrics()
+        except asyncio.CancelledError:
+            break 
+        except Exception as e:
+            logging.error(f"Fehler im Spot User Stream: {e}. Verbinde neu in 5s...")
+        finally:
+            if 'keepalive_task' in locals() and not keepalive_task.done():
+                keepalive_task.cancel()
+            await asyncio.sleep(5)
+
+async def futures_user_stream_handler(client: AsyncClient):
+    futures_ws_user_url = FUTURES_WS_URL.split('/stream?streams=')[0] 
+    while True:
+        try:
+            listen_key = await client.futures_stream_get_listen_key()
+            url = f"{futures_ws_user_url}/{listen_key}"
+            
+            async def keepalive():
+                while True:
+                    await asyncio.sleep(30 * 60) # Alle 30 Minuten
+                    await client.futures_stream_keepalive(listenKey=listen_key)
+
+            keepalive_task = asyncio.create_task(keepalive())
+
+            async with websockets.connect(url) as websocket:
+                logging.info("Futures User Data Stream verbunden.")
+                async for message in websocket:
+                    data = json.loads(message)
+                    if data.get('e') == 'ACCOUNT_UPDATE':
+                        update_data = data.get('a', {})
+                        for balance_update in update_data.get('B', []):
+                            asset_symbol = balance_update.get('a')
+                            for asset in account_state_cache['futures_account']['assets']:
+                                if asset['asset'] == asset_symbol:
+                                    asset['walletBalance'] = balance_update.get('wb')
+                                    break
+
+                        total_pnl = 0.0
+                        for pos_update in update_data.get('P', []):
+                            for i, pos in enumerate(account_state_cache['futures_account']['positions']):
+                                if pos['symbol'] == pos_update.get('s'):
+                                    pos['unrealizedProfit'] = pos_update.get('up')
+                                    pos['positionAmt'] = pos_update.get('pa')
+                                    break
+                            else: 
+                                 account_state_cache['futures_account']['positions'].append(pos_update)
+
+                        for pos in account_state_cache['futures_account']['positions']:
+                            total_pnl += float(pos.get('unrealizedProfit', 0.0))
+
+                        account_state_cache['futures_account']['totalUnrealizedProfit'] = str(total_pnl)
+                        recalculate_account_metrics()
+        except Exception as e:
+            logging.error(f"Fehler im Futures User Stream: {e}. Verbinde neu in 5s...")
+        finally:
+            if 'keepalive_task' in locals() and not keepalive_task.done():
+                keepalive_task.cancel()
+            await asyncio.sleep(5)
 
 async def check_and_run_maintenance(client: AsyncClient):
     if not ENABLE_MAINTENANCE or tracked_opportunities: return
@@ -993,6 +1154,7 @@ async def check_and_run_maintenance(client: AsyncClient):
 async def debug_logger():
     while True:
         try:
+            await log_account_state()
             open_legs = [opp for opp in tracked_opportunities.values() if opp.status == "open"]
             if open_legs:
                 log_lines = ["\n--- Offene Legs ---"]
@@ -1032,7 +1194,7 @@ async def debug_logger():
                 logging.info("\n".join(log_lines))
                 debug_top_opportunities.clear()
 
-            await asyncio.sleep(SYSTEM_TASK_INTERVAL_SECONDS)
+            await asyncio.sleep(DEBUG_TASK_INTERVAL_SECONDS)
 
         except asyncio.CancelledError: 
             break
@@ -1100,7 +1262,7 @@ async def run_main(args):
     try:
         client = await AsyncClient.create(API_KEY, API_SECRET)
         logging.info("Performing initial account state cache, interest and funding rate fetch...")
-        await log_and_update_cache(client)
+        await initial_account_sync(client)
         await update_interest_rates(client)
         await update_funding_rates(client)
 
@@ -1108,6 +1270,9 @@ async def run_main(args):
         known_bases = await get_valid_pairs(client)
         logging.info(f"Initially found {len(known_bases)} pairs.")
 
+        tasks.append(asyncio.create_task(btc_price_stream_handler(client)))
+        tasks.append(asyncio.create_task(spot_user_stream_handler(client)))
+        tasks.append(asyncio.create_task(futures_user_stream_handler(client)))
         tasks.append(asyncio.create_task(stream_handler(FUTURES_WS_URL, 'future', args.debug)))
         if known_bases:
             spot_stream_names = [f"{base.lower()}{SPOT_QUOTE_CURRENCY.lower()}@bookTicker" for base in known_bases]
@@ -1123,6 +1288,7 @@ async def run_main(args):
             tasks.append(asyncio.create_task(debug_logger()))
 
         await asyncio.gather(*tasks)
+        
     except asyncio.CancelledError:
         logging.info("Shutdown sequence initiated.")
     finally:
